@@ -48,22 +48,25 @@ export const ClassificationBox: React.FC<ClassificationBoxProps> = ({ plugin, fi
         }
         setContentLoadStatus('success');
 
-        const result = await plugin.classifyContent(fileContent, file.basename);
-        if (result && typeof result.type === 'string' && typeof result.formattingInstruction === 'string') {
-          setClassification(result);
-          setSelectedTemplate(result);
-        } else {
-          console.warn('Invalid classification result, using empty classification');
-          setClassification(null);
-          setSelectedTemplate(null);
-        }
-        setClassificationStatus('success');
-
         const fetchedTemplates = await plugin.getTemplates();
         if (!Array.isArray(fetchedTemplates) || !fetchedTemplates.every(t => typeof t.type === 'string' && typeof t.formattingInstruction === 'string')) {
           throw new Error('Invalid templates data');
         }
         setTemplates(fetchedTemplates);
+
+        const templateNames = fetchedTemplates.map(t => t.type);
+        const classifiedType = await plugin.classifyContentV2(fileContent, templateNames);
+        
+        const selectedClassification = fetchedTemplates.find(t => t.type.toLowerCase() === classifiedType.toLowerCase());
+        if (selectedClassification) {
+          setClassification(selectedClassification);
+          setSelectedTemplate(selectedClassification);
+        } else {
+          console.warn('No matching classification found, using empty classification');
+          setClassification(null);
+          setSelectedTemplate(null);
+        }
+        setClassificationStatus('success');
       } catch (error) {
         console.error('Error in fetchClassificationAndTemplates:', error);
         setClassificationStatus('error');
@@ -97,7 +100,11 @@ export const ClassificationBox: React.FC<ClassificationBoxProps> = ({ plugin, fi
       if (typeof fileContent !== 'string') {
         throw new Error('File content is not a string');
       }
-      await plugin.formatContent(file, fileContent, template.formattingInstruction);
+      await plugin.formatContent({
+        file: file,
+        content: fileContent,
+        formattingInstruction: template.formattingInstruction,
+      });
       setClassification(template);
       setSelectedTemplate(null);
     } catch (error) {
