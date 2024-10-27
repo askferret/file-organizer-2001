@@ -6,24 +6,23 @@ import React, {
   useMemo,
 } from "react";
 import { useChat, UseChatOptions } from "@ai-sdk/react";
-import { getEncoding } from "js-tiktoken";
-import { TFolder, TFile, moment, App } from "obsidian";
+import { TFolder, TFile, moment, App, debounce } from "obsidian";
 
 import FileOrganizer from "../..";
 import Tiptap from "./tiptap";
-import { ToolInvocation } from "ai";
 import { Button } from "./button";
-import { Avatar } from "./avatar";
-import { AIMarkdown } from "./ai-message-renderer";
-import { UserMarkdown } from "./user-message-renderer";
 import { usePlugin } from "./provider";
-import ToolInvocationHandler from "./tool-invocation-handler";
-import {
-  getYouTubeTranscript,
-  getYouTubeVideoTitle,
-} from "./youtube-transcript";
+
 import { logMessage } from "../../../utils";
-import { summarizeMeeting, getDailyInformation } from "./screenpipe-utils";
+import { SelectedItem } from "./selected-item";
+import { MessageRenderer } from "./message-renderer";
+import ToolInvocationHandler from "./tool-invocation-handler";
+import { convertToCoreMessages, streamText, ToolInvocation } from "ai";
+import { ollama } from "ollama-ai-provider";
+import { getChatSystemPrompt } from "../../../web/lib/prompts/chat-prompt";
+import { ContextLimitIndicator } from "./context-limit-indicator";
+import { ModelSelector } from "./model-selector";
+import { ModelType } from "./types";
 
 interface ChatComponentProps {
   plugin: FileOrganizer;
@@ -34,6 +33,22 @@ interface ChatComponentProps {
   history: { id: string; role: string; content: string }[];
   setHistory: (
     newHistory: { id: string; role: string; content: string }[]
+  ) => void;
+  onDateRangeResults: (
+    results: {
+      title: string;
+      content: string;
+      reference: string;
+      path: string;
+    }[]
+  ) => void;
+  onLastModifiedResults: (
+    results: {
+      title: string;
+      content: string;
+      reference: string;
+      path: string;
+    }[]
   ) => void;
 }
 
@@ -94,28 +109,6 @@ const filterNotesByDateRange = async (
   return fileContents;
 };
 
-const SelectedItem = ({
-  item,
-  onRemove,
-  prefix = "",
-  onClick,
-}: {
-  item: string;
-  onRemove: () => void;
-  prefix?: string;
-  onClick: () => void;
-}) => (
-  <div key={item} className={`selected-file`}>
-    <button onClick={onClick} className="item-label">
-      {prefix}
-      {item}
-    </button>
-    <button onClick={onRemove} className="remove-button">
-      x
-    </button>
-  </div>
-);
-
 export const ChatComponent: React.FC<ChatComponentProps> = ({
   fileContent,
   fileName,
@@ -123,6 +116,8 @@ export const ChatComponent: React.FC<ChatComponentProps> = ({
   inputRef,
   history,
   setHistory,
+  onDateRangeResults,
+  onLastModifiedResults,
 }) => {
   const plugin = usePlugin();
   const app = plugin.app;
@@ -143,8 +138,6 @@ export const ChatComponent: React.FC<ChatComponentProps> = ({
   const [selectedYouTubeVideos, setSelectedYouTubeVideos] = useState<
     { videoId: string; title: string; transcript: string }[]
   >([]);
-  const [contextSize, setContextSize] = useState(0);
-  const [maxContextSize, setMaxContextSize] = useState(80 * 1000); // Default to GPT-3.5-turbo
   const [screenpipeContext, setScreenpipeContext] = useState<any>(null);
 
   logMessage(unifiedContext, "unifiedContext");
@@ -156,89 +149,6 @@ export const ChatComponent: React.FC<ChatComponentProps> = ({
     logMessage(selectedFolders, "selectedFolders");
     logMessage(selectedYouTubeVideos, "selectedYouTubeVideos");
   }, [selectedFiles, selectedTags, selectedFolders, selectedYouTubeVideos]);
-
-  const searchNotes = async (query: string) => {
-    const files = plugin.getAllUserMarkdownFiles();
-    const searchTerms = query.toLowerCase().split(/\s+/);
-
-    const searchResults = await Promise.all(
-      files.map(async file => {
-        const content = await plugin.app.vault.read(file);
-        const lowerContent = content.toLowerCase();
-
-        // Check if all search terms are present in the content
-        const allTermsPresent = searchTerms.every(term => {
-          const regex = new RegExp(`(^|\\W)${term}(\\W|$)`, "i");
-          return regex.test(lowerContent);
-        });
-
-        if (allTermsPresent) {
-          return {
-            title: file.basename,
-            content: content,
-            reference: `Search query: ${query}`,
-            path: file.path,
-          };
-        }
-        return null;
-      })
-    );
-    // Filter out null results
-    const filteredResults = searchResults.filter(result => result !== null);
-    //
-    if (filteredResults.length === 0) {
-      logMessage("No files returned");
-    }
-
-    return filteredResults;
-  };
-
-  const getLastModifiedFiles = async (count: number) => {
-    const files = plugin.getAllUserMarkdownFiles();
-    const sortedFiles = files.sort((a, b) => b.stat.mtime - a.stat.mtime);
-    const lastModifiedFiles = sortedFiles.slice(0, count);
-
-    const fileContents = await Promise.all(
-      lastModifiedFiles.map(async file => ({
-        title: file.basename,
-        content: await plugin.app.vault.read(file),
-        path: file.path,
-      }))
-    );
-
-    return fileContents; // Make sure to stringify the result
-  };
-
-  const handleScreenpipeAction = async (toolCall: any) => {
-    if (!plugin.settings.enableScreenpipe) {
-      return "Screenpipe integration is not enabled. Please enable it in the plugin settings.";
-    }
-
-    switch (toolCall.toolName) {
-      case "summarizeMeeting":
-        const { duration } = toolCall.args as { duration: number };
-        try {
-          const result = await summarizeMeeting(duration);
-          setScreenpipeContext(result);
-          return JSON.stringify(result);
-        } catch (error) {
-          console.error("Error summarizing meeting:", error);
-          return JSON.stringify({ error: error.message });
-        }
-      case "getDailyInformation":
-        const { date } = toolCall.args as { date?: string };
-        try {
-          const result = await getDailyInformation(date);
-          setScreenpipeContext(result);
-          return JSON.stringify(result);
-        } catch (error) {
-          console.error("Error getting daily information:", error);
-          return JSON.stringify({ error: error.message });
-        }
-      default:
-        return "Unknown Screenpipe action";
-    }
-  };
 
   // Create a memoized body object that updates when its dependencies change
   const chatBody = useMemo(
@@ -259,14 +169,53 @@ export const ChatComponent: React.FC<ChatComponentProps> = ({
     stop,
     addToolResult,
   } = useChat({
+    maxSteps: 2,
     api: `${plugin.getServerUrl()}/api/chat`,
     body: chatBody,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
     },
+    fetch: async (url, options) => {
+      logMessage(plugin.settings.showLocalLLMInChat, "showLocalLLMInChat");
+      logMessage(selectedModel, "selectedModel");
+      // local llm disabled or using gpt-4o
+      if (!plugin.settings.showLocalLLMInChat) {
+        // return normal server fetch
+        return fetch(url, options);
+      }
+      if (selectedModel === "gpt-4o") {
+        return fetch(url, options);
+      }
+
+      if (selectedModel === "llama3.2") {
+        const { messages, unifiedContext } = JSON.parse(options.body as string);
+
+        const contextString = unifiedContext
+          .map(file => {
+            // this should be better formatted Start with path, title, reference, content
+            return `Path: ${file.path}\nTitle: ${file.title}\nReference: ${file.reference}\nContent:\n${file.content}`;
+          })
+          .join("\n\n-------\n\n");
+        console.log(contextString, "contextString");
+
+        const result = await streamText({
+          model: ollama("llama3.2"),
+          system: getChatSystemPrompt(
+            contextString,
+            plugin.settings.enableScreenpipe,
+            moment().format("YYYY-MM-DDTHH:mm:ssZ")
+          ),
+          messages: convertToCoreMessages(messages),
+        });
+
+        return result.toDataStreamResponse();
+      }
+
+      // Default fetch behavior for remote API
+      return fetch(url, options);
+    },
     keepLastMessageOnError: true,
-    maxSteps: 1,
     onError: error => {
       console.error(error);
       setErrorMessage(
@@ -275,126 +224,6 @@ export const ChatComponent: React.FC<ChatComponentProps> = ({
     },
     onFinish: () => {
       setErrorMessage(null);
-    },
-
-    async onToolCall({ toolCall }) {
-      logMessage(toolCall, "toolCall");
-      if (toolCall.toolName === "getYouTubeTranscript") {
-        const args = toolCall.args as { videoId: string };
-        const { videoId } = args;
-        try {
-          const transcript = await getYouTubeTranscript(videoId);
-          const title = await getYouTubeVideoTitle(videoId);
-          setSelectedYouTubeVideos(prev => [
-            ...prev,
-
-            { videoId, title, transcript },
-          ]);
-          logMessage(transcript, "transcript");
-          addToolResult({
-            toolCallId: toolCall.toolCallId,
-            result: { transcript, title, videoId },
-          });
-          return { transcript, title, videoId };
-        } catch (error) {
-          console.error("Error fetching YouTube transcript:", error);
-          return JSON.stringify({ error: error.message });
-        }
-      } else if (toolCall.toolName === "getNotesForDateRange") {
-        const args = toolCall.args as { startDate: string; endDate: string };
-        const { startDate, endDate } = args;
-        logMessage(startDate, endDate, "startDate, endDate");
-        const filteredNotes = await filterNotesByDateRange(
-          startDate,
-          endDate,
-          plugin
-        );
-
-        // Add filtered Markdown notes to selectedFiles
-        setSelectedFiles(prevFiles => {
-          const newFiles = filteredNotes
-            .map(note => ({
-              title: note.title,
-              content: note.content,
-              reference: `Date range: ${startDate} to ${endDate}`,
-              path: note.path,
-            }))
-            .filter(
-              file => !prevFiles.some(prevFile => prevFile.path === file.path)
-            );
-          return [...prevFiles, ...newFiles];
-        });
-
-        // Return a message about the fetched notes
-        return `Fetched ${filteredNotes.length} notes for the date range: ${startDate} to ${endDate}`;
-      } else if (toolCall.toolName === "searchNotes") {
-        const args = toolCall.args as { query: string };
-        const { query } = args;
-        const searchResults = await searchNotes(query);
-
-        // Add search results to selectedFiles
-        setSelectedFiles(prevFiles => {
-          const newFiles = searchResults.filter(
-            file => !prevFiles.some(prevFile => prevFile.path === file.path)
-          );
-          return [...prevFiles, ...newFiles];
-        });
-
-        // Pass search results to the tool invocation handler
-        toolCall.results = searchResults;
-        logMessage(searchResults, "searchResults");
-        return JSON.stringify(searchResults);
-      } else if (toolCall.toolName === "modifyCurrentNote") {
-        const args = toolCall.args as { formattingInstruction: string };
-        const { formattingInstruction } = args;
-        const activeFile = plugin.app.workspace.getActiveFile();
-        if (activeFile) {
-          try {
-            const currentContent = await plugin.app.vault.read(activeFile);
-            await plugin.formatContent(
-              activeFile,
-              currentContent,
-              formattingInstruction
-            );
-            return `Successfully modified the current note "${activeFile.basename}" using the formatting instruction.`;
-          } catch (error) {
-            console.error("Error modifying note:", error);
-            return "Failed to modify the current note.";
-          }
-        } else {
-          return "No active file found.";
-        }
-      } else if (toolCall.toolName === "getLastModifiedFiles") {
-        const args = toolCall.args as { count: number };
-        const { count } = args;
-        const lastModifiedFiles = await getLastModifiedFiles(count);
-        logMessage(lastModifiedFiles, "lastModifiedFiles");
-
-        // Add last modified files to selectedFiles
-        setSelectedFiles(prevFiles => {
-          const newFiles = lastModifiedFiles
-            .map(file => ({
-              title: file.title,
-              content: file.content,
-              reference: `Last modified: ${file.title}`,
-              path: file.path,
-            }))
-            .filter(
-              file => !prevFiles.some(prevFile => prevFile.path === file.path)
-            );
-          return [...prevFiles, ...newFiles];
-        });
-        toolCall.args = {
-          count: lastModifiedFiles.length,
-          files: lastModifiedFiles,
-        };
-
-        return lastModifiedFiles.length.toString();
-      } else if (
-        ["summarizeMeeting", "getDailyInformation"].includes(toolCall.toolName)
-      ) {
-        return handleScreenpipeAction(toolCall);
-      }
     },
   } as UseChatOptions);
 
@@ -526,7 +355,7 @@ export const ChatComponent: React.FC<ChatComponentProps> = ({
       const tags = await plugin.getAllVaultTags();
       setAllTags(tags);
 
-      const folders = plugin.getAllFolders();
+      const folders = plugin.getAllNonFo2kFolders();
       setAllFolders(folders);
     };
 
@@ -542,6 +371,37 @@ export const ChatComponent: React.FC<ChatComponentProps> = ({
   const handleAddCurrentFile = () => {
     setIncludeCurrentFile(true);
   };
+  useEffect(() => {
+    // Create a debounced version of the file change handler
+    const debouncedFileChange = debounce(async (file: TFile) => {
+      const content = await app.vault.read(file);
+      setUnifiedContext(prev => {
+        const filtered = prev.filter(item => item.path !== file.path);
+        return [
+          ...filtered,
+          {
+            title: file.basename,
+            content: content,
+            path: file.path,
+            reference: `Current File: ${file.basename}`,
+          },
+        ];
+      });
+    }, 1000); // 1 second delay
+
+    // Set up the event listener
+    const onActiveFileChange = (file: TFile) => {
+      debouncedFileChange(file);
+    };
+
+    app.vault.on("modify", onActiveFileChange);
+
+    // Cleanup
+    return () => {
+      app.vault.off("modify", onActiveFileChange);
+      debouncedFileChange.cancel();
+    };
+  }, [fileName, app.vault]);
 
   useEffect(() => {
     const updateUnifiedContext = async () => {
@@ -675,93 +535,147 @@ export const ChatComponent: React.FC<ChatComponentProps> = ({
     );
   };
 
-  useEffect(() => {
-    const calculateContextSize = () => {
-      const encoding = getEncoding("o200k_base");
+  const [maxContextSize] = useState(80 * 1000); // Keep this one
 
-      let totalTokens = 0;
-      unifiedContext.forEach(item => {
-        totalTokens += encoding.encode(item.content).length;
+  const handleActionButton = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (isGenerating) {
+      handleCancelGeneration();
+    } else {
+      handleSendMessage(e);
+    }
+  };
+
+  const handleYouTubeTranscript = useCallback(
+    (transcript: string, title: string, videoId: string) => {
+      console.log(transcript, "this is the transcript");
+      setSelectedYouTubeVideos(prev => [
+        ...prev,
+        {
+          videoId,
+          title,
+          transcript,
+        },
+      ]);
+    },
+    []
+  );
+
+  const handleSearchResults = useCallback(
+    (
+      results: {
+        title: string;
+        content: string;
+        reference: string;
+        path: string;
+      }[]
+    ) => {
+      setSelectedFiles(prevFiles => {
+        const newFiles = results.filter(
+          file => !prevFiles.some(prevFile => prevFile.path === file.path)
+        );
+        return [...prevFiles, ...newFiles];
       });
+    },
+    []
+  );
 
-      setContextSize(totalTokens);
-    };
+  const handleDateRangeResults = useCallback(
+    (
+      results: {
+        title: string;
+        content: string;
+        reference: string;
+        path: string;
+      }[]
+    ) => {
+      setSelectedFiles(prevFiles => {
+        const newFiles = results.filter(
+          file => !prevFiles.some(prevFile => prevFile.path === file.path)
+        );
+        return [...prevFiles, ...newFiles];
+      });
+    },
+    []
+  );
 
-    calculateContextSize();
-  }, [unifiedContext]);
+  const handleLastModifiedResults = useCallback(
+    (
+      results: {
+        title: string;
+        content: string;
+        reference: string;
+        path: string;
+      }[]
+    ) => {
+      setSelectedFiles(prevFiles => {
+        const newFiles = results.filter(
+          file => !prevFiles.some(prevFile => prevFile.path === file.path)
+        );
+        return [...prevFiles, ...newFiles];
+      });
+    },
+    []
+  );
 
-  const isContextOverLimit = contextSize > maxContextSize;
+  // Update state to default to gpt-4
+  const [selectedModel, setSelectedModel] = useState<ModelType>("gpt-4o");
 
   return (
-    <div className="chat-component">
-      <div className="chat-messages">
-        <div className="chat-messages-inner">
-          {history.map(message => (
-            <div key={message.id} className={`message ${message.role}-message`}>
-              <Avatar role={message.role as "user" | "assistant"} />
-              <div className="message-content">
-                <AIMarkdown content={message.content} />
-              </div>
-            </div>
-          ))}
+    <div className="flex flex-col h-full max-h-screen bg-[--background-primary]">
+      <div className="flex-grow overflow-y-auto p-4">
+        <div className="flex flex-col min-h-min-content">
           {messages.map(message => (
-            <div key={message.id} className={`message `}>
-              <Avatar role={message.role as "user" | "assistant"} />
-              <div className="message-content">
-                {message.role === "user" ? (
-                  <UserMarkdown content={message.content} />
-                ) : message.toolInvocations ? (
-                  <UserMarkdown content={message.content} />
-                ) : (
-                  <AIMarkdown content={message.content} />
-                )}
-                {message.toolInvocations?.map(
-                  (toolInvocation: ToolInvocation) => (
+            <React.Fragment key={message.id}>
+              <MessageRenderer message={message} />
+              {message.toolInvocations?.map(
+                (toolInvocation: ToolInvocation) => {
+                  return (
                     <ToolInvocationHandler
                       key={toolInvocation.toolCallId}
                       toolInvocation={toolInvocation}
                       addToolResult={addToolResult}
-                      // search results (files added to context)
-                      results={toolInvocation.results}
+                      results={toolInvocation.state}
+                      onYoutubeTranscript={handleYouTubeTranscript}
+                      onSearchResults={handleSearchResults}
+                      onDateRangeResults={handleDateRangeResults}
+                      onLastModifiedResults={handleLastModifiedResults}
+                      app={app}
                     />
-                  )
-                )}
-              </div>
-            </div>
+                  );
+                }
+              )}
+            </React.Fragment>
           ))}
           <div ref={messagesEndRef} />
         </div>
       </div>
 
-      <div className="context-info">
-        {contextSize / maxContextSize > 0.75 && (
-          <p>
-            Context Size: {Math.round((contextSize / maxContextSize) * 100)}%
-          </p>
-        )}
-        {isContextOverLimit && (
-          <p className="warning">Warning: Context size exceeds maximum!</p>
-        )}
-      </div>
-
-      {errorMessage && (
-        <div className="error-message">
-          {errorMessage}
+      <div className="border-t border-[--background-modifier-border] p-4">
+        <div className="flex items-center space-x-2 mb-4">
           <Button
-            type="button"
-            onClick={() => handleRetry(messages[messages.length - 1].content)}
-            className="retry-button"
+            onClick={() => {
+              handleAddCurrentFile();
+            }}
+            className="bg-[--interactive-normal] hover:bg-[--interactive-hover] text-[--text-normal]"
           >
-            Retry
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill="currentColor"
+              className="w-4 h-4 mr-2"
+            >
+              <path
+                fillRule="evenodd"
+                d="M12 3.75a.75.75 0 01.75.75v6.75h6.75a.75.75 0 010 1.5h-6.75v6.75a.75.75 0 01-1.5 0v-6.75H4.5a.75.75 0 010-1.5h6.75V4.5a.75.75 0 01.75-.75z"
+                clipRule="evenodd"
+              />
+            </svg>
+            Add Current File
           </Button>
-        </div>
-      )}
 
-      <div className="chat-input-wrapper">
-        <div className="context-container">
-          <div className="selected-items-container">
-            <h6 className="selected-items-header">Context</h6>
-            <div className="selected-items">
+          <div className="flex-grow overflow-x-auto">
+            <div className="flex space-x-2">
               {fileName && includeCurrentFile && (
                 <SelectedItem
                   key="current-file"
@@ -777,7 +691,7 @@ export const ChatComponent: React.FC<ChatComponentProps> = ({
                   item={file.title}
                   onClick={() => handleOpenFile(file.title)}
                   onRemove={() => handleRemoveFile(file.path)}
-                  prefix=" "
+                  prefix="📄 "
                 />
               ))}
               {selectedFolders.map((folder, index) => (
@@ -825,43 +739,40 @@ export const ChatComponent: React.FC<ChatComponentProps> = ({
                   key="screenpipe-context"
                   item="Screenpipe Data"
                   onClick={() => {
-                    /* You can add an action here if needed */
+                    /* Handle Screenpipe data click */
                   }}
                   onRemove={() => setScreenpipeContext(null)}
                   prefix="📊 "
                 />
               )}
             </div>
-
-            <div className="context-actions">
-              {fileName && !includeCurrentFile && (
-                <Button
-                  onClick={handleAddCurrentFile}
-                  className="add-current-file-button"
-                >
-                  Add Current File to Context
-                </Button>
-              )}
-              {(selectedFiles.length > 0 ||
-                selectedFolders.length > 0 ||
-                selectedTags.length > 0 ||
-                includeCurrentFile ||
-                selectedYouTubeVideos.length > 0 ||
-                screenpipeContext) && (
-                <Button onClick={handleClearAll} className="clear-all-button">
-                  Clear All Context
-                </Button>
-              )}
-            </div>
           </div>
+
+          <Button
+            onClick={handleClearAll}
+            className="bg-[--interactive-normal] hover:bg-[--interactive-hover] text-[--text-normal]"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill="currentColor"
+              className="w-4 h-4"
+            >
+              <path
+                fillRule="evenodd"
+                d="M16.5 4.478v.227a48.816 48.816 0 013.878.512.75.75 0 11-.256 1.478l-.209-.035-1.005 13.07a3 3 0 01-2.991 2.77H8.084a3 3 0 01-2.991-2.77L4.087 6.66l-.209.035a.75.75 0 01-.256-1.478A48.567 48.567 0 017.5 4.705v-.227c0-1.564 1.213-2.9 2.816-2.951a52.662 52.662 0 013.369 0c1.603.051 2.815 1.387 2.815 2.951zm-6.136-1.452a51.196 51.196 0 013.273 0C14.39 3.05 15 3.684 15 4.478v.113a49.488 49.488 0 00-6 0v-.113c0-.794.609-1.428 1.364-1.452zm-.355 5.945a.75.75 0 10-1.5.058l.347 9a.75.75 0 101.499-.058l-.346-9zm5.48.058a.75.75 0 10-1.498-.058l-.347 9a.75.75 0 001.5.058l.345-9z"
+                clipRule="evenodd"
+              />
+            </svg>
+          </Button>
         </div>
 
         <form
           ref={formRef}
-          onSubmit={handleSendMessage}
-          className="chat-input-form"
+          onSubmit={handleActionButton}
+          className="flex items-end"
         >
-          <div className="tiptap-wrapper" ref={inputRef}>
+          <div className="flex-grow overflow-y-auto" ref={inputRef}>
             <Tiptap
               value={input}
               onChange={handleTiptapChange}
@@ -878,48 +789,49 @@ export const ChatComponent: React.FC<ChatComponentProps> = ({
           </div>
           <Button
             type="submit"
-            className="send-button"
-            disabled={isGenerating || isContextOverLimit}
+            className={`h-full ml-2 font-bold py-2 px-4 rounded ${
+              isGenerating
+                ? "bg-[--background-modifier-form-field] text-[--text-muted] cursor-not-allowed"
+                : "bg-[--interactive-accent] hover:bg-[--interactive-accent-hover] text-[--text-on-accent]"
+            }`}
           >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              viewBox="0 0 24 24"
-              fill="currentColor"
-              style={{ width: "20px", height: "20px" }}
-            >
-              <path d="M3.478 2.405a.75.75 0 00-.926.94l2.432 7.905H13.5a.75.75 0 010 1.5H4.984l-2.432 7.905a.75.75 0 00.926.94 60.519 60.519 0 0018.445-8.986.75.75 0 000-1.218A60.517 60.517 0 003.478 2.405z" />
-            </svg>
+            {isGenerating ? (
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                fill="currentColor"
+                className="w-5 h-5"
+              >
+                <path
+                  fillRule="evenodd"
+                  d="M4.5 7.5a3 3 0 013-3h9a3 3 0 013 3v9a3 3 0 01-3 3h-9a3 3 0 01-3-3v-9z"
+                  clipRule="evenodd"
+                />
+              </svg>
+            ) : (
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                fill="currentColor"
+                className="w-5 h-5"
+              >
+                <path d="M3.478 2.405a.75.75 0 00-.926.94l2.432 7.905H13.5a.75.75 0 010 1.5H4.984l-2.432 7.905a.75.75 0 00.926.94 60.519 60.519 0 0018.445-8.986.75.75 0 000-1.218A60.517 60.517 0 003.478 2.405z" />
+              </svg>
+            )}
           </Button>
         </form>
-        <div className="current-file-tip">
-          <div className="tip-item-1">
-            <span className="tip-icon">Tip 1️⃣</span>
-            <span className="tip-text">
-              To add more files to the AI context, mention them in the chat
-              using the format @filename
-            </span>
-          </div>
-          <div className="tip-item-2">
-            <span className="tip-icon">Tip 2️⃣</span>
-            <span className="tip-text">
-              Or use prompts like "get notes from this week" or "get YouTube
-              transcript", then follow up with your question (e.g. "summarize my
-              notes/transcript") in a separate message
-            </span>
-          </div>
-        </div>
-        {isGenerating && (
-          <Button onClick={handleCancelGeneration} className="cancel-button">
-            Cancel Generation
-          </Button>
-        )}
-      </div>
 
-      {isContextOverLimit && (
-        <div className="context-warning">
-          Context size exceeds maximum. Please remove some context to continue.
+        <div className="flex items-center justify-between">
+          <ContextLimitIndicator
+            unifiedContext={unifiedContext}
+            maxContextSize={maxContextSize}
+          />
+            <ModelSelector
+              selectedModel={selectedModel}
+              onModelSelect={setSelectedModel}
+            />
         </div>
-      )}
+      </div>
     </div>
   );
 };

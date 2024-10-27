@@ -1,3 +1,5 @@
+// import '../styles.css'; // Removed to prevent JS from injecting CSS
+
 import {
   Plugin,
   Notice,
@@ -5,19 +7,24 @@ import {
   TFile,
   TAbstractFile,
   moment,
-  WorkspaceLeaf,
   normalizePath,
   loadPdfJs,
   requestUrl,
 } from "obsidian";
 import { logMessage, formatToSafeName, sanitizeTag } from "../utils";
-import { FileOrganizerSettingTab } from "./views/configuration/tabs";
-import { ASSISTANT_VIEW_TYPE, AssistantViewWrapper } from "./views/organizer";
-import Jimp from "jimp";
+import { FileOrganizerSettingTab } from "./views/settings/view";
+import { ORGANIZER_VIEW_TYPE } from "./views/organizer";
+import { CHAT_VIEW_TYPE } from "./views/ai-chat/view";
+import Jimp from "jimp/es/index";
+
 import { FileOrganizerSettings, DEFAULT_SETTINGS } from "./settings";
 
 import { registerEventHandlers } from "./handlers/eventHandlers";
-import { registerCommandHandlers } from "./handlers/commandHandlers";
+import {
+  initializeChat,
+  initializeOrganizer,
+  initializeFileOrganizationCommands,
+} from "./handlers/commandHandlers";
 import {
   ensureFolderExists,
   checkAndCreateFolders,
@@ -26,7 +33,6 @@ import {
   getAllFolders,
 } from "./fileUtils";
 import { checkLicenseKey } from "./apiUtils";
-import { AIChatView } from "./views/ai-chat/view";
 import { makeApiRequest } from "./apiUtils";
 
 type TagCounts = {
@@ -123,86 +129,247 @@ export default class FileOrganizer extends Plugin {
     return serverUrl;
   }
 
-  // all files in inbox will go through this function
+  /**
+   * Processes a file by organizing it and logging the actions.
+   * @param originalFile - The file to process.
+   * @param oldPath - The previous path of the file, if any.
+   */
   async processFileV2(originalFile: TFile, oldPath?: string): Promise<void> {
-    try {
-      new Notice(`Processing ${originalFile.basename}`, 3000);
+    const formattedDate = moment().format("YYYY-MM-DD");
+    const processedFileName = originalFile.basename;
+    const logFilePath = `${this.settings.logFolderPath}/${formattedDate}-fo2k.md`;
 
+    try {
+      // Initialize log file
+      await this.ensureLogFileExists(logFilePath);
+      await this.log(
+        logFilePath,
+        `\n\n## Processing Start: ${processedFileName}\n`
+      );
+
+      new Notice(`Processing ${processedFileName}`, 3000);
+      await this.log(logFilePath, `Started processing ${processedFileName}`);
+
+      // Validate file extension
       if (
         !originalFile.extension ||
         !isValidExtension(originalFile.extension)
       ) {
+        await this.log(
+          logFilePath,
+          `2. Unsupported file type. Skipping ${processedFileName}`
+        );
         new Notice("Unsupported file type. Skipping.", 3000);
         return;
       }
 
+      // Ensure necessary folders exist
       await this.checkAndCreateFolders();
 
+      // Step 1: Read file content
       let text: string;
       try {
         text = await this.getTextFromFile(originalFile);
+        await this.log(
+          logFilePath,
+          `1. Read content from ${processedFileName}`
+        );
       } catch (error) {
-        new Notice(`Error reading file ${originalFile.basename}`, 3000);
+        await this.log(
+          logFilePath,
+          `2. Error reading file ${processedFileName}: ${error.message}`
+        );
+        new Notice(`Error reading file ${processedFileName}`, 3000);
         console.error(`Error in getTextFromFile:`, error);
         return;
       }
 
-      let instructions: any;
-      try {
-        instructions = await this.generateInstructions(originalFile);
-      } catch (error) {
-        new Notice(
-          `Error generating instructions for ${originalFile.basename}`,
-          3000
+      // Step 2: Classify and format content
+      let formattedText = text;
+      if (this.settings.enableDocumentClassification) {
+        const { classification, formattedText: newFormattedText } =
+          await this.classifyAndFormatContent(originalFile, text);
+        formattedText = newFormattedText;
+        await this.log(
+          logFilePath,
+          `3. Classified as ${classification || "unclassified"}`
         );
-        console.error(`Error in generateInstructions:`, error);
-        return;
       }
 
-      let metadata: any;
-      try {
-        metadata = await this.generateMetadata(
-          originalFile,
-          instructions,
-          text,
-          oldPath
+      // Step 3: Determine new folder
+      const newPath = await this.getAIClassifiedFolder(
+        formattedText,
+        originalFile.path
+      );
+      await this.log(logFilePath, `4. Determined new folder: ${newPath}`);
+
+      // Step 4: Generate new file name
+      const newName = await this.generateNameFromContent(
+        text,
+        originalFile.basename
+      );
+      await this.log(logFilePath, `5. Generated new name: ${newName}`);
+
+      // Step 5: Handle media files
+      if (this.shouldCreateMarkdownContainer(originalFile)) {
+        // Create markdown container
+        const containerFile = await this.app.vault.create(
+          `${this.settings.defaultDestinationPath}/${Date.now()}.md`,
+          `${text}\n\n---\n![[${originalFile.name}]]`
         );
-      } catch (error) {
-        new Notice(
-          `Error generating metadata for ${originalFile.basename}`,
-          3000
+        await this.log(
+          logFilePath,
+          `6. Created markdown container: [[${containerFile.path}]]`
         );
-        console.error(`Error in generateMetadata:`, error);
-        return;
+
+        // Move original file to new location
+        await this.moveFile(originalFile, originalFile.basename, newPath);
+        await this.log(
+          logFilePath,
+          `7. Moved original to: ${newPath}/${originalFile.basename}`
+        );
+
+        // Move original file to attachments folder
+        await this.moveToAttachmentFolder(originalFile, newName);
+        await this.log(logFilePath, `8. Moved to attachments: ${newName}`);
+
+        // Process the markdown container file
+        if (this.settings.useSimilarTags) {
+          await this.generateAndAppendSimilarTags(containerFile, text, newName);
+          await this.log(logFilePath, `9. Added similar tags.`);
+        }
+
+        if (this.settings.enableAliasGeneration) {
+          await this.generateAndAppendAliases(containerFile, newName, text);
+          await this.log(logFilePath, `10. Added aliases.`);
+        }
+      } else {
+        // For non-media files, process the original file
+        if (this.settings.useSimilarTags) {
+          await this.generateAndAppendSimilarTags(originalFile, text, newName);
+          await this.log(logFilePath, `6. Added similar tags.`);
+        }
+
+        if (this.settings.enableAliasGeneration) {
+          await this.generateAndAppendAliases(originalFile, newName, text);
+          await this.log(logFilePath, `7. Added aliases.`);
+        }
+
+        // Move the file to the new folder
+        await this.moveFile(originalFile, newName, newPath);
+        await this.log(logFilePath, `8. Renamed and moved to: [[${newName}]]`);
       }
 
-      try {
-        await this.executeInstructions(metadata, originalFile, text);
-      } catch (error) {
-        new Notice(
-          `Error executing instructions for ${originalFile.basename}`,
-          3000
-        );
-        console.error(`Error in executeInstructions:`, error);
-      }
+      await this.log(logFilePath, `10. Completed processing.`);
+      new Notice(`Processed ${processedFileName}`, 3000);
     } catch (error) {
-      new Notice(`Unexpected error processing ${originalFile.basename}`, 3000);
+      await this.log(
+        logFilePath,
+        `Error processing ${processedFileName}: ${error.message}`
+      );
+      new Notice(`Unexpected error processing ${processedFileName}`, 3000);
       console.error(`Error in processFileV2:`, error);
     }
   }
 
-  async generateInstructions(
-    file: TFile
-  ): Promise<FileMetadata["instructions"]> {
-    const shouldClassify = this.settings.enableDocumentClassification;
-    const shouldAppendAlias = this.settings.enableAliasGeneration;
-    const shouldAppendSimilarTags = this.settings.useSimilarTags;
+  /**
+   * Ensures that the log file exists. If not, creates it.
+   * @param logFilePath - The path to the log file.
+   */
+  async ensureLogFileExists(logFilePath: string): Promise<void> {
+    if (!(await this.app.vault.adapter.exists(normalizePath(logFilePath)))) {
+      await this.app.vault.create(logFilePath, "");
+    }
+  }
 
-    return {
-      shouldClassify,
-      shouldAppendAlias,
-      shouldAppendSimilarTags,
-    };
+  /**
+   * Appends a single log entry to the specified log file.
+   * @param logFilePath - The path to the log file.
+   * @param message - The log message to append.
+   */
+  async log(logFilePath: string, message: string): Promise<void> {
+    const logFile = this.app.vault.getAbstractFileByPath(logFilePath);
+    if (!(logFile instanceof TFile)) {
+      throw new Error(`Log file at path "${logFilePath}" is not a valid file.`);
+    }
+
+    const timestamp = moment().format("HH:mm:ss");
+    const formattedMessage = `[${timestamp}] ${message}\n`;
+    await this.app.vault.append(logFile, formattedMessage);
+  }
+
+  // Helper methods
+
+  async generateAndApplyNewName(file: TFile, content: string): Promise<string> {
+    const newName = await this.generateNameFromContent(content, file.basename);
+    await this.app.fileManager.renameFile(
+      file,
+      `${file.parent?.path}/${newName}.${file.extension}`
+    );
+    return newName;
+  }
+
+  async classifyAndFormatContent(
+    file: TFile,
+    content: string
+  ): Promise<{ classification?: string; formattedText: string }> {
+    const result = await this.classifyAndFormat(file, content);
+    if (result) {
+      await this.app.vault.modify(file, result.formattedText);
+      return {
+        classification: result.type,
+        formattedText: result.formattedText,
+      };
+    }
+    return { formattedText: content };
+  }
+
+  async determineAndMoveToNewFolder(
+    file: TFile,
+    content: string
+  ): Promise<string> {
+    const newPath = await this.getAIClassifiedFolder(content, file.path);
+    await this.moveFile(file, file.basename, newPath);
+    return newPath;
+  }
+
+  async generateAndAppendAliases(
+    file: TFile,
+    newName: string,
+    content: string
+  ): Promise<void> {
+    const aliases = await this.generateAliasses(newName, content);
+    for (const alias of aliases) {
+      await this.appendAlias(file, alias);
+    }
+  }
+
+  async generateAndAppendSimilarTags(
+    file: TFile,
+    content: string,
+    newName: string
+  ): Promise<void> {
+    const similarTags = await this.getSimilarTags(content, newName);
+    for (const tag of similarTags) {
+      await this.appendTag(file, tag);
+    }
+  }
+
+  shouldCreateMarkdownContainer(file: TFile): boolean {
+    return (
+      validMediaExtensions.includes(file.extension) || file.extension === "pdf"
+    );
+  }
+
+  async createMarkdownContainerForMedia(
+    originalFile: TFile,
+    newPath: string
+  ): Promise<void> {
+    const containerFile = await this.app.vault.create(
+      `${newPath}/${originalFile.basename}.md`,
+      `![[${originalFile.name}]]`
+    );
+    await this.moveToAttachmentFolder(originalFile, originalFile.basename);
   }
 
   async generateMetadata(
@@ -278,86 +445,6 @@ export default class FileOrganizer extends Plugin {
     }
   }
 
-  async retrieveFileToModify(originalFile: TFile, isMedia: boolean) {
-    if (isMedia) {
-      this.appendToCustomLogFile(`Created markdown find to annotate media`);
-      return await this.app.vault.create(
-        `${this.settings.defaultDestinationPath}/${originalFile.basename}.md`,
-        ""
-      );
-    }
-
-    return originalFile;
-  }
-
-  async executeInstructions(
-    metadata: FileMetadata,
-    fileBeingProcessed: TFile,
-    text: string
-  ): Promise<void> {
-    // Create a new markdown file in default folder
-    const fileToOrganize = await this.retrieveFileToModify(
-      fileBeingProcessed,
-      metadata.shouldCreateMarkdownContainer
-    );
-
-    // If it's a brand new markdown file it should be annotated
-    if (metadata.shouldCreateMarkdownContainer) {
-      await this.app.vault.modify(fileToOrganize, text);
-      this.appendToCustomLogFile(
-        `Annotated ${
-          metadata.shouldCreateMarkdownContainer ? "media" : "file"
-        } [[${metadata.newName}]]`
-      );
-    }
-
-    // If it should be classified/formatted
-    if (metadata.instructions.shouldClassify && metadata.classification) {
-      const backupFile = await this.backupTheFileAndAddReferenceToCurrentFile(
-        fileToOrganize
-      );
-      await this.app.vault.modify(fileToOrganize, metadata.aiFormattedText);
-      await this.appendBackupLinkToCurrentFile(fileToOrganize, backupFile);
-
-      this.appendToCustomLogFile(
-        `Classified [[${metadata.newName}]] as ${metadata.classification} and formatted it with [[${this.settings.templatePaths}/${metadata.classification}]]`
-      );
-    }
-
-    // append the attachment as a reference to audio, image, or pdf files.
-    if (metadata.shouldCreateMarkdownContainer) {
-      const mediaFile = fileBeingProcessed;
-      await this.moveToAttachmentFolder(mediaFile, metadata.newName);
-      this.appendToCustomLogFile(
-        `Moved [[${mediaFile.basename}.${mediaFile.extension}]] to attachments folders`
-      );
-      await this.appendAttachment(fileToOrganize, mediaFile);
-      this.appendToCustomLogFile(`Added attachment to [[${metadata.newName}]]`);
-    }
-
-    // Move the file to its new location
-    await this.moveFile(fileToOrganize, metadata.newName, metadata.newPath);
-    this.appendToCustomLogFile(
-      `Renamed ${metadata.originalName} to [[${fileToOrganize.basename}]]`
-    );
-    this.appendToCustomLogFile(
-      `Organized [[${fileToOrganize.basename}]] into ${metadata.newPath}`
-    );
-
-    // Handle similar tags
-    if (
-      metadata.instructions.shouldAppendSimilarTags &&
-      metadata.similarTags.length > 0
-    ) {
-      for (const tag of metadata.similarTags) {
-        await this.appendTag(fileToOrganize, tag);
-      }
-      this.appendToCustomLogFile(
-        `Appended similar tags to [[${fileToOrganize.basename}]]`
-      );
-    }
-  }
-
   async generateAliasses(name: string, content: string): Promise<string[]> {
     const response = await makeApiRequest(() =>
       requestUrl({
@@ -386,7 +473,6 @@ export default class FileOrganizer extends Plugin {
       return [];
     }
 
-    console.log("serverUrl tag", this.getServerUrl());
     const response = await makeApiRequest(() =>
       requestUrl({
         url: `${this.getServerUrl()}/api/tags`,
@@ -439,31 +525,31 @@ export default class FileOrganizer extends Plugin {
 
   async classifyAndFormat(file: TFile, content: string) {
     try {
-      const templates = await this.getTemplates();
-      const templateNames = templates.map(t => t.type);
+      const templateNames = await this.getTemplateNames();
 
       const classifiedType = await this.classifyContentV2(
         content,
         templateNames
       );
 
-      const selectedTemplate = templates.find(
-        t => t.type.toLowerCase() === classifiedType.toLowerCase()
-      );
-      console.log("selectedTemplate", selectedTemplate);
-
-      if (selectedTemplate) {
-        const formattedText = await this.formatContentV2(
-          content,
-          selectedTemplate.formattingInstruction
+      if (classifiedType) {
+        const formattingInstruction = await this.getTemplateInstructions(
+          classifiedType
         );
 
-        console.log("formattedText", formattedText);
-        return {
-          type: classifiedType,
-          formattingInstruction: selectedTemplate.formattingInstruction,
-          formattedText,
-        };
+        if (formattingInstruction) {
+          const formattedText = await this.formatContentV2(
+            content,
+            formattingInstruction
+          );
+
+          console.log("formattedText", formattedText);
+          return {
+            type: classifiedType,
+            formattingInstruction,
+            formattedText,
+          };
+        }
       }
 
       return null;
@@ -718,18 +804,7 @@ export default class FileOrganizer extends Plugin {
 
   async transcribeAudio(
     audioBuffer: ArrayBuffer,
-    fileExtension: string,
-    {
-      usePro,
-      serverUrl,
-      fileOrganizerApiKey,
-      openAIApiKey,
-    }: {
-      usePro: boolean;
-      serverUrl: string;
-      fileOrganizerApiKey: string;
-      openAIApiKey: string;
-    }
+    fileExtension: string
   ): Promise<Response> {
     const formData = new FormData();
     const blob = new Blob([audioBuffer], { type: `audio/${fileExtension}` });
@@ -742,7 +817,7 @@ export default class FileOrganizer extends Plugin {
       method: "POST",
       body: formData,
       headers: {
-        Authorization: `Bearer ${fileOrganizerApiKey}`,
+        Authorization: `Bearer ${this.settings.API_KEY}`,
         // "Content-Type": "multipart/form-data",
       },
     });
@@ -762,12 +837,7 @@ export default class FileOrganizer extends Plugin {
     );
     try {
       const audioBuffer = await this.app.vault.readBinary(file);
-      const response = await this.transcribeAudio(audioBuffer, file.extension, {
-        usePro: this.settings.usePro,
-        serverUrl: this.getServerUrl(),
-        fileOrganizerApiKey: this.settings.API_KEY,
-        openAIApiKey: this.settings.openAIApiKey,
-      });
+      const response = await this.transcribeAudio(audioBuffer, file.extension);
 
       if (!response.body) {
         throw new Error("Response body is null");
@@ -828,7 +898,7 @@ export default class FileOrganizer extends Plugin {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      const { documentType } = await response.json();
+      const { documentType } = await response.json;
       return documentType;
     } catch (error) {
       console.error("Error in classifyContentV2:", error);
@@ -846,16 +916,37 @@ export default class FileOrganizer extends Plugin {
   }
 
   async showAssistantSidebar() {
-    this.app.workspace.detachLeavesOfType(ASSISTANT_VIEW_TYPE);
+    this.app.workspace.detachLeavesOfType(ORGANIZER_VIEW_TYPE);
 
-    await this.app.workspace.getRightLeaf(false).setViewState({
-      type: ASSISTANT_VIEW_TYPE,
+    await this.app.workspace.getRightLeaf(false)?.setViewState({
+      type: ORGANIZER_VIEW_TYPE,
       active: true,
     });
 
     this.app.workspace.revealLeaf(
-      this.app.workspace.getLeavesOfType(ASSISTANT_VIEW_TYPE)[0]
+      this.app.workspace.getLeavesOfType(ORGANIZER_VIEW_TYPE)[0]
     );
+  }
+  async showAIChatView() {
+    // Detach any existing leaves of the AI Chat View type to ensure a fresh instance
+    this.app.workspace.detachLeavesOfType(CHAT_VIEW_TYPE);
+
+    // Create or get a new leaf on the right sidebar
+    const leaf = this.app.workspace.getRightLeaf(false);
+    if (!leaf) {
+      console.error("Failed to obtain a workspace leaf for AI Chat View.");
+      new Notice("Unable to open AI Chat View.", 3000);
+      return;
+    }
+
+    // Set the view state to the AI Chat View
+    await leaf.setViewState({
+      type: CHAT_VIEW_TYPE,
+      active: true,
+    });
+
+    // Reveal the leaf to focus it
+    this.app.workspace.revealLeaf(leaf);
   }
 
   async getTextFromFile(file: TFile): Promise<string> {
@@ -868,8 +959,15 @@ export default class FileOrganizer extends Plugin {
       }
       case validImageExtensions.includes(file.extension):
         return await this.generateImageAnnotation(file);
-      case validAudioExtensions.includes(file.extension):
-        return await this.generateTranscriptFromAudio(file);
+      case validAudioExtensions.includes(file.extension): {
+        // Change this part to consume the iterator
+        const transcriptIterator = await this.generateTranscriptFromAudio(file);
+        let transcriptText = "";
+        for await (const chunk of transcriptIterator) {
+          transcriptText += chunk;
+        }
+        return transcriptText;
+      }
       default:
         throw new Error(`Unsupported file type: ${file.extension}`);
     }
@@ -939,7 +1037,7 @@ export default class FileOrganizer extends Plugin {
     return allFilesFiltered;
   }
 
-  getAllFolders(): string[] {
+  getAllNonFo2kFolders(): string[] {
     const allFolders = getAllFolders(this.app);
 
     // if ignoreFolders includes * then return all folders
@@ -953,7 +1051,8 @@ export default class FileOrganizer extends Plugin {
       .filter(folder => folder !== this.settings.defaultDestinationPath)
       .filter(folder => folder !== this.settings.attachmentsPath)
       .filter(folder => folder !== this.settings.backupFolderPath)
-      .filter(folder => folder !== this.settings.templatePaths);
+      .filter(folder => folder !== this.settings.templatePaths)
+      .filter(folder => folder !== this.settings.fabricPatternPath);
   }
 
   async getSimilarFiles(fileToCheck: TFile): Promise<string[]> {
@@ -1199,7 +1298,7 @@ export default class FileOrganizer extends Plugin {
   ): Promise<string> {
     let destinationFolder = "None";
 
-    const uniqueFolders = await this.getAllFolders();
+    const uniqueFolders = await this.getAllNonFo2kFolders();
     logMessage("uniqueFolders", uniqueFolders);
 
     logMessage("ignore folders", this.settings.ignoreFolders);
@@ -1230,14 +1329,14 @@ export default class FileOrganizer extends Plugin {
     logMessage("filteredFolders", filteredFolders);
 
     const customInstructions = this.settings.enableCustomFolderInstructions
-    ? this.settings.customFolderInstructions
-    : undefined;
+      ? this.settings.customFolderInstructions
+      : undefined;
 
     const guessedFolder = await this.guessRelevantFolder(
       content,
       filePath,
       filteredFolders,
-      customInstructions,
+      customInstructions
     );
 
     if (guessedFolder === null || guessedFolder === "null") {
@@ -1258,7 +1357,7 @@ export default class FileOrganizer extends Plugin {
     content: string,
     filePath: string,
     folders: string[],
-    customInstructions?: string,
+    customInstructions?: string
   ): Promise<string | null> {
     const response = await makeApiRequest(() =>
       requestUrl({
@@ -1329,36 +1428,8 @@ export default class FileOrganizer extends Plugin {
       await this.appendTag(file, tag);
     });
 
-    await this.appendToCustomLogFile(
-      `Added similar tags to [[${file.basename}]]`
-    );
     new Notice(`Added similar tags to ${file.basename}`, 3000);
     return;
-  }
-
-  async appendToCustomLogFile(contentToAppend: string, action = "") {
-    if (!this.settings.useLogs) {
-      return;
-    }
-    const now = new Date();
-    const formattedDate = moment(now).format("YYYY-MM-DD");
-    const logFilePath = `${this.settings.logFolderPath}/${formattedDate}..md`;
-    // if does not exist create it
-    if (!(await this.app.vault.adapter.exists(normalizePath(logFilePath)))) {
-      await this.app.vault.create(logFilePath, "");
-    }
-
-    const logFile = this.app.vault.getAbstractFileByPath(logFilePath);
-    if (!(logFile instanceof TFile)) {
-      throw new Error(`File with path ${logFilePath} is not a markdown file`);
-    }
-
-    const formattedTime =
-      now.getHours().toString().padStart(2, "0") +
-      ":" +
-      now.getMinutes().toString().padStart(2, "0");
-    const contentWithLink = `\n - ${formattedTime} ${contentToAppend}`;
-    await this.app.vault.append(logFile, contentWithLink);
   }
 
   validateAPIKey() {
@@ -1377,12 +1448,13 @@ export default class FileOrganizer extends Plugin {
   async onload() {
     await this.initializePlugin();
 
-    this.addRibbonIcon("sparkle", "Fo2k Assistant View", () => {
-      this.showAssistantSidebar();
-    });
+    this.settings.fabricPatternPath = "_FileOrganizer2000/Fabric";
+    await this.saveSettings();
 
-    // Register command handlers
-    registerCommandHandlers(this);
+    // Initialize different features
+    initializeChat(this);
+    initializeOrganizer(this);
+    initializeFileOrganizationCommands(this);
 
     this.app.workspace.onLayoutReady(() => registerEventHandlers(this));
     this.processBacklog();
@@ -1391,50 +1463,11 @@ export default class FileOrganizer extends Plugin {
     await this.saveData(this.settings);
   }
 
-  async initializeChat() {
-    this.addRibbonIcon("bot", "Fo2k Chat", () => {
-      this.activateView();
-    });
-
-    this.registerView("ai-chat-view", leaf => new AIChatView(leaf, this));
-
-    this.addCommand({
-      id: "open-ai-chat",
-      name: "Fo2k Open AI Chat",
-      callback: () => {
-        this.activateView();
-      },
-    });
-  }
-
-  async activateView() {
-    const { workspace } = this.app;
-
-    let leaf: WorkspaceLeaf | null = null;
-    const leaves = workspace.getLeavesOfType("ai-chat-view");
-
-    if (leaves.length > 0) {
-      leaf = leaves[0];
-    } else {
-      leaf = workspace.getRightLeaf(false);
-      await leaf.setViewState({ type: "ai-chat-view", active: true });
-    }
-
-    if (leaf) {
-      workspace.revealLeaf(leaf);
-    }
-  }
-
   async initializePlugin() {
     await this.loadSettings();
     await this.checkAndCreateFolders();
     await this.checkAndCreateTemplates();
-    await this.initializeChat();
     this.addSettingTab(new FileOrganizerSettingTab(this.app, this));
-    this.registerView(
-      ASSISTANT_VIEW_TYPE,
-      (leaf: WorkspaceLeaf) => new AssistantViewWrapper(leaf, this)
-    );
   }
 
   async appendTranscriptToActiveFile(
@@ -1484,51 +1517,53 @@ export default class FileOrganizer extends Plugin {
     return backupFile;
   }
 
-  async getTemplates(): Promise<
-    { type: string; formattingInstruction: string }[]
-  > {
+  async getTemplateInstructions(templateName: string): Promise<string> {
     const templateFolder = this.app.vault.getAbstractFileByPath(
       this.settings.templatePaths
     );
-
+    if (!templateFolder || !(templateFolder instanceof TFolder)) {
+      console.error("Template folder not found or is not a valid folder.");
+      return "";
+    }
+    // only look at files first
+    const templateFile = templateFolder.children.find(
+      file => file instanceof TFile && file.basename === templateName
+    );
+    if (!templateFile || !(templateFile instanceof TFile)) {
+      console.error("Template file not found or is not a valid file.");
+      return "";
+    }
+    return await this.app.vault.read(templateFile);
+  }
+  // create a getTemplatesV2 that returns a list of template names only
+  // and doesn't reuse getTemplates()
+  async getTemplateNames(): Promise<string[]> {
+    // get all file names in the template folder
+    const templateFolder = this.app.vault.getAbstractFileByPath(
+      this.settings.templatePaths
+    );
     if (!templateFolder || !(templateFolder instanceof TFolder)) {
       console.error("Template folder not found or is not a valid folder.");
       return [];
     }
-
     const templateFiles = templateFolder.children.filter(
       file => file instanceof TFile
     ) as TFile[];
-
-    const templates = await Promise.all(
-      templateFiles.map(async file => ({
-        type: file.basename,
-        formattingInstruction: await this.app.vault.read(file),
-      }))
-    );
-
-    return templates;
+    return templateFiles.map(file => file.basename);
   }
 
   async getExistingFolders(
     content: string,
     filePath: string
   ): Promise<string[]> {
-    const uniqueFolders = await this.getAllFolders();
     if (this.settings.ignoreFolders.includes("*")) {
       return [this.settings.defaultDestinationPath];
     }
     const currentFolder =
       this.app.vault.getAbstractFileByPath(filePath)?.parent?.path || "";
-    const filteredFolders = uniqueFolders
+    const filteredFolders = this.getAllNonFo2kFolders()
       .filter(folder => folder !== currentFolder)
-      .filter(folder => folder !== filePath)
-      .filter(folder => folder !== this.settings.defaultDestinationPath)
-      .filter(folder => folder !== this.settings.attachmentsPath)
-      .filter(folder => folder !== this.settings.logFolderPath)
-      .filter(folder => folder !== this.settings.pathToWatch)
-      .filter(folder => folder !== this.settings.templatePaths)
-      .filter(folder => !folder.includes("_FileOrganizer2000"))
+
       // if  this.settings.ignoreFolders has one or more folder specified, filter them out including subfolders
       .filter(folder => {
         const hasIgnoreFolders =
@@ -1571,7 +1606,7 @@ export default class FileOrganizer extends Plugin {
     }
   }
   async getNewFolders(content: string, filePath: string): Promise<string[]> {
-    const uniqueFolders = await this.getAllFolders();
+    const uniqueFolders = await this.getAllNonFo2kFolders();
     if (this.settings.ignoreFolders.includes("*")) {
       return [this.settings.defaultDestinationPath];
     }

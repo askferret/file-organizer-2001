@@ -1,4 +1,4 @@
-import { PreSRMConfig } from "@u22n/srm";
+import { PreSRMConfig } from "@u22n/srm/dist";
 
 const features = {
   support: "Support",
@@ -35,9 +35,9 @@ const webhookEndpoint = `https://${targetUrl}/api/webhook`;
 export const config = {
   features: features,
   products: {
-    Hobby: {
-      name: "Subscription Plan",
-      id: "subscription",
+    HobbyMonthly: {
+      name: "Hobby Monthly Plan",
+      id: "subscription_monthly",
       prices: {
         monthly: {
           // $15
@@ -45,20 +45,36 @@ export const config = {
           interval: "month",
           type: "recurring",
         },
+      },
+      features: [
+        features.noExternalAI,
+        features.easySetup,
+        features.fileLimit,
+        features.audioTranscription,
+        features.support,
+        features.moneyBackGuarantee,
+      ],
+    },
+    HobbyYearly: {
+      name: "Hobby Yearly Plan",
+      id: "subscription_yearly",
+      prices: {
         yearly: {
-          // $150
-          amount: 15000, // Adjust this to match your current price
+          // $99
+          amount: 9900, // Adjust this to match your current price
           interval: "year",
           type: "recurring",
+          trialPeriodDays: 3, // Add trial period for annual plan
+
         },
       },
       features: [
-        features.support,
         features.freeTrial,
         features.noExternalAI,
         features.easySetup,
         features.fileLimit,
         features.audioTranscription,
+        features.support,
         features.moneyBackGuarantee,
       ],
     },
@@ -67,20 +83,19 @@ export const config = {
       id: "lifetime",
       prices: {
         lifetime: {
-          // $250
-          amount: 25000, // Adjust this to match your current price
+          // $199
+          amount: 19900, // Adjust this to match your current price
           interval: "one_time",
           type: "one_time",
         },
       },
       features: [
-        features.support,
         features.privacy,
-        features.premiumSupport,
-        features.audioTranscription,
-        features.moneyBackGuarantee,
-        features.guidedSetup,
         features.payAsYouGo,
+        features.guidedSetup,
+        features.audioTranscription,
+        features.premiumSupport,
+        features.moneyBackGuarantee,
       ],
     },
   },
